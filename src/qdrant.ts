@@ -7,7 +7,7 @@ import { embedText, embedTextSync, VECTOR_SIZE } from "./embeddings.js"; // Adde
 
 // Define our own type for vector points since the library doesn't export it
 export interface PointStruct {
-  id: string; // Qdrant requires string IDs
+  id: string | number; // Qdrant requires string IDs or unsigned integers
   vector: number[];
   payload: {
     pageUrl: string;
@@ -110,11 +110,12 @@ export async function upsertChunksToQdrant(
         );
 
         points.push({
-          id: `${fileSlug}-${batchStart + i}`, // Ensure unique ID
+          id: batchStart + i, // Use numeric ID instead of string ID
           vector,
           payload: {
             pageUrl: item.metadata.pageUrl,
             chunk: item.chunk,
+            fileSlug, // Store the fileSlug in the payload for reference
             // Add other metadata if needed
           },
         });

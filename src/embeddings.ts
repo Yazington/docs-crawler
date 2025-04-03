@@ -77,29 +77,80 @@ export async function embedText(text: string): Promise<number[]> {
   }
 }
 
+// Cache for embeddings to avoid recalculating
+const embeddingCache = new Map<string, number[]>();
+
 /**
- * Synchronous wrapper for backward compatibility with the current API
- * This function simply runs the async function and returns a default vector
- * while the real vector is being computed
+ * Simple hashing function for text
+ */
+function simpleHash(text: string): string {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash.toString();
+}
+
+/**
+ * Generate a deterministic but unique vector for text based on its content
+ * Not as good as ML-based embeddings, but better than identical placeholders
+ */
+function generateDeterministicVector(text: string): number[] {
+  // Create a seed based on text content
+  const seed = simpleHash(text);
+  const seedNum = parseInt(seed);
+
+  // Use the seed to generate a deterministic but unique vector
+  const vector = new Array(VECTOR_SIZE);
+
+  // Simple pseudo-random number generator with the seed
+  let value = seedNum;
+
+  for (let i = 0; i < VECTOR_SIZE; i++) {
+    // Generate next pseudo-random value
+    value = (value * 9301 + 49297) % 233280;
+    // Convert to a value between -1 and 1
+    vector[i] = (value / 233280) * 2 - 1;
+  }
+
+  // Normalize the vector to unit length
+  const magnitude = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
+  return vector.map((val) => val / magnitude);
+}
+
+/**
+ * Synchronous wrapper that provides deterministic embeddings
+ * This is a temporary solution until we can properly implement async embeddings
  */
 export function embedTextSync(text: string): number[] {
-  // Start the async embedding process but don't wait for it
+  // Check if we've already calculated this embedding
+  const cacheKey = text.slice(0, 100); // Use first 100 chars as cache key
+
+  if (embeddingCache.has(cacheKey)) {
+    return embeddingCache.get(cacheKey)!;
+  }
+
+  console.error(
+    "Warning: Using synchronous embedding function with async backend"
+  );
+
+  // Generate a deterministic but unique vector based on the text content
+  const vector = generateDeterministicVector(text);
+
+  // Cache the result
+  embeddingCache.set(cacheKey, vector);
+
+  // Also start the async embedding process in the background for future use
   embedText(text)
-    .then((vector) => {
-      // Store it somewhere if needed
-      // This is just to satisfy TypeScript
-      return vector;
+    .then((asyncVector) => {
+      // Update the cache with the proper embedding when it's done
+      embeddingCache.set(cacheKey, asyncVector);
     })
     .catch((error) => {
       console.error("Error in async embedding:", error);
     });
 
-  // Return a placeholder vector (all zeros normalized to 1/sqrt(VECTOR_SIZE))
-  // This maintains the expected function signature while we transition to async
-  // A value of 1/sqrt(VECTOR_SIZE) ensures the vector has a magnitude of 1
-  const placeholder = new Array(VECTOR_SIZE).fill(1 / Math.sqrt(VECTOR_SIZE));
-  console.error(
-    "Warning: Using synchronous embedding function with async backend"
-  );
-  return placeholder;
+  return vector;
 }
