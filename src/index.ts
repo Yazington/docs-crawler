@@ -574,7 +574,7 @@ server.tool(
 // ---------- TOOL #2: search docs ----------
 server.tool(
   "search-docs",
-  "Search the previously crawled docs for relevant chunks",
+  "Search the previously crawled docs for relevant chunks. Please use different queries relateded to the current conversation to find what you are looking for. Do at least 3 queries",
   {
     baseUrl: z
       .string()
