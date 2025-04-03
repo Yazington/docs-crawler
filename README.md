@@ -2,6 +2,12 @@
 
 This project implements a Model Context Protocol (MCP) server that allows you to crawl documentation websites, store the content locally, and search through it using vector embeddings.
 
+--------
+![image](https://github.com/user-attachments/assets/fc3ff083-f786-4a80-a726-9e0d376a5b58)
+--------
+
+
+
 ## Features
 
 This server provides two main tools accessible via MCP:
