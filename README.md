@@ -82,7 +82,8 @@ Add the following entry to the `mcpServers` object in the settings file. **Make 
       "args": ["<absolute_path_to_docs_tool>/build/index.js"],
       "env": {},
       "disabled": false,
-      "autoApprove": []
+      "autoApprove": [],
+      "timeout": 300000 // add this -> crawler uses puppeteer so it takes some time.
     }
     // ... other servers might be here ...
   }

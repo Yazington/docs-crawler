@@ -2,11 +2,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod"; // Move zod import to the top
 
 import * as fs from "fs";
 import * as path from "path";
-import fetch from "node-fetch";
-import * as cheerio from "cheerio";
+import puppeteer from "puppeteer";
 import * as os from "os";
 
 // For local vector DB (Qdrant):
@@ -26,7 +26,7 @@ const qdrantClient = new QdrantClient({
   url: "http://localhost:6333", // Adjust if needed
 });
 
-// We’ll store everything in a named “collection” in Qdrant.
+// We'll store everything in a named "collection" in Qdrant.
 // Each unique baseUrl can be its own collection name, for easy isolation.
 async function ensureCollectionExists(
   collectionName: string,
@@ -156,16 +156,49 @@ function chunkTextTo6000Chars(rawText: string): string[] {
 }
 
 // ---------- HELPER: CLEAN TEXT FROM HTML ----------
+// This function is kept for backwards compatibility but will not be used directly
+// as Puppeteer will handle the text extraction now
 function extractTextFromHTML(html: string): string {
-  const $ = cheerio.load(html);
-
-  // Remove script and style tags
-  $("script, style").remove();
-
-  // Get text from body
-  const text = $("body").text() || "";
   // Clean up whitespace
-  return text.replace(/\s+/g, " ").trim();
+  return html.replace(/\s+/g, " ").trim();
+}
+
+// New function to extract text using Puppeteer
+async function extractTextFromPage(page: puppeteer.Page): Promise<string> {
+  // Extract text content from the page
+  const textContent = await page.evaluate(() => {
+    // Remove script and style elements from consideration
+    const scripts = document.querySelectorAll("script, style");
+    scripts.forEach((script) => script.remove());
+
+    // Get text from body
+    return document.body.innerText || "";
+  });
+
+  // Clean up whitespace
+  return textContent.replace(/\s+/g, " ").trim();
+}
+
+// New function to extract links using Puppeteer
+async function extractLinksFromPage(
+  page: puppeteer.Page,
+  baseUrl: string
+): Promise<string[]> {
+  // Extract all links from the page
+  const links = await page.evaluate((baseUrl) => {
+    const anchors = Array.from(document.querySelectorAll("a"));
+    const hrefs = anchors.map((anchor) => anchor.href).filter((href) => href);
+
+    // Filter links to only include those from the same domain or relative paths
+    return hrefs.filter((href) => {
+      if (href.startsWith(baseUrl)) {
+        return true; // same domain
+      }
+      return false;
+    });
+  }, baseUrl);
+
+  return Array.from(new Set(links)); // Remove duplicates
 }
 
 // ---------- HELPER: BFS-CRAWL (Depth=2) ----------
@@ -216,176 +249,200 @@ async function bfsCrawl(baseUrl: string, forceRecrawl: boolean): Promise<void> {
   ];
   const visited = new Set<string>();
 
-  while (toVisit.length > 0) {
-    const { url, depth } = toVisit.shift()!;
-    if (visited.has(url)) {
-      continue;
-    }
-    visited.add(url);
+  // Initialize the browser once for the entire crawl
+  console.error(`Launching Puppeteer browser...`);
+  const browser = await puppeteer.launch({
+    headless: true, // Use headless mode
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
+  });
 
-    // Fetch page
-    console.error(`Crawling: ${url} (depth=${depth})...`);
-    let resp;
-    try {
-      resp = await fetch(url, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      });
-
-      if (!resp.ok) {
-        console.error(`Failed to fetch (${resp.status}): ${url}`);
-        console.error(`Status text: ${resp.statusText}`);
+  try {
+    while (toVisit.length > 0) {
+      const { url, depth } = toVisit.shift()!;
+      if (visited.has(url)) {
         continue;
       }
-    } catch (err) {
-      console.error(`Error fetching ${url}:`, err);
-      continue;
-    }
+      visited.add(url);
 
-    const html = await resp.text();
-    const textContent = extractTextFromHTML(html);
-    const linksFound: string[] = [];
+      // Fetch page using Puppeteer
+      console.error(`Crawling: ${url} (depth=${depth})...`);
 
-    // We only want links that share the same baseUrl domain or are relative
-    if (depth === 1) {
-      const $ = cheerio.load(html);
-      $("a[href]").each((_i, el) => {
-        const href = $(el).attr("href");
-        if (!href) return;
+      // Create a new page for each URL
+      const page = await browser.newPage();
 
-        // Check if it's internal or same domain
-        if (href.startsWith("http")) {
-          if (href.startsWith(baseUrl)) {
-            // same domain
-            linksFound.push(href);
-          }
-        } else if (href.startsWith("/")) {
-          // relative link
-          const fullLink = baseUrl.replace(/\/+$/, "") + href; // e.g. "https://example.com/docs" + "/subpage"
-          linksFound.push(fullLink);
-        }
-      });
-    }
-
-    // For BFS, if we are in depth=1, we add discovered links as depth=2
-    // (No deeper than 2).
-    if (depth === 1) {
-      for (const link of linksFound) {
-        if (!visited.has(link)) {
-          toVisit.push({ url: link, depth: 2 });
-        }
-      }
-    }
-
-    // Now chunk the text, store to disk as JSON, store vectors in Qdrant
-    if (textContent.trim().length === 0) {
-      console.error(`No textual content found at ${url}`);
-      continue;
-    }
-
-    const chunks = chunkTextTo6000Chars(textContent);
-    const pageData = chunks.map((chunk) => ({
-      chunk,
-      metadata: {
-        pageUrl: url,
-        linksFound,
-      },
-    }));
-
-    // Write out JSON
-    // file name = slug of page url
-    const fileSlug = url
-      .replace(/https?:\/\//, "")
-      .replace(/[^\w\d]+/g, "_")
-      .toLowerCase();
-
-    // Write to data folder
-    const filePath = path.join(dataFolder, fileSlug + ".json");
-    fs.writeFileSync(filePath, JSON.stringify(pageData, null, 2), "utf-8");
-
-    // Also write to home directory crawl folder
-    const homeFilePath = path.join(homeCrawlFolder, fileSlug + ".json");
-    fs.writeFileSync(homeFilePath, JSON.stringify(pageData, null, 2), "utf-8");
-
-    // Create an array of points with properly awaited embeddings
-    console.error(`Creating embeddings for ${chunks.length} chunks...`);
-
-    // Process in smaller batches to avoid memory issues
-    const BATCH_SIZE = 5;
-    let batchCounter = 0;
-
-    for (
-      let batchStart = 0;
-      batchStart < pageData.length;
-      batchStart += BATCH_SIZE
-    ) {
-      batchCounter++;
-      console.error(`Processing batch ${batchCounter}...`);
-
-      const batchItems = pageData.slice(batchStart, batchStart + BATCH_SIZE);
-      const points: PointStruct[] = [];
-
-      // Generate embeddings for this batch
-      for (const item of batchItems) {
-        try {
-          // Generate embedding directly from the chunk
-          const vector = embedText(item.chunk);
-          console.error(
-            `Generated vector with ${vector.length} dimensions for chunk of ${item.chunk.length} chars`
-          );
-
-          points.push({
-            vector,
-            payload: {
-              pageUrl: item.metadata.pageUrl,
-              chunk: item.chunk,
-            },
-          });
-        } catch (error) {
-          console.error(`Error embedding chunk: ${error}`);
-        }
-      }
-
-      if (points.length === 0) {
-        console.error(`No valid points in batch ${batchCounter}, skipping...`);
-        continue;
-      }
-
-      console.error(`Upserting ${points.length} points to Qdrant...`);
+      let textContent = "";
+      let linksFound: string[] = [];
 
       try {
-        // Prepare array of IDs - make sure they're globally unique across all batches
-        const ids = points.map((_, idx) => `${fileSlug}-${batchStart + idx}`);
-        const vectors = points.map((p) => p.vector);
-        const payloads = points.map((p) => p.payload);
+        // Set user agent and other options
+        await page.setUserAgent(
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        );
 
-        // Batch upsert to Qdrant
-        const result = await qdrantClient.upsert(baseUrlSlug, {
-          wait: true,
-          batch: {
-            ids,
-            vectors,
-            payloads,
-          },
+        // Set request timeout to avoid hanging
+        await page.setDefaultNavigationTimeout(30000);
+
+        // Navigate to the page
+        const response = await page.goto(url, {
+          waitUntil: "networkidle2", // Wait until network is idle to ensure dynamic content is loaded
         });
 
-        console.error(`Batch ${batchCounter} upsert result:`, result);
+        // Check if the page was loaded successfully
+        const status = response?.status();
+        if (!response || (status && status >= 400)) {
+          console.error(`Failed to load page (${status}): ${url}`);
+          await page.close(); // Close the page to free resources
+          continue;
+        }
+
+        // Extract text content from the page using our helper
+        textContent = await extractTextFromPage(page);
+
+        // Extract links but only if we're at depth 1
+        if (depth === 1) {
+          // Use our helper to extract links from the page
+          const extractedLinks = await extractLinksFromPage(page, baseUrl);
+          linksFound = extractedLinks;
+
+          // Add found links to the queue for BFS traversal
+          for (const link of linksFound) {
+            if (!visited.has(link)) {
+              toVisit.push({ url: link, depth: 2 });
+            }
+          }
+        }
       } catch (err) {
-        console.error(`Error upserting batch ${batchCounter} to Qdrant:`, err);
-        if (err instanceof Error) {
-          console.error(`Error name: ${err.name}`);
-          console.error(`Error message: ${err.message}`);
-          console.error(`Error stack: ${err.stack}`);
+        console.error(`Error processing ${url}:`, err);
+        await page.close(); // Make sure to close the page even if there's an error
+        continue;
+      } finally {
+        // Always close the page to free resources
+        await page.close();
+      }
+
+      // Process the content only if we found text
+      if (textContent.trim().length === 0) {
+        console.error(`No textual content found at ${url}`);
+        continue;
+      }
+
+      // Chunk the text for processing
+      const chunks = chunkTextTo6000Chars(textContent);
+      const pageData = chunks.map((chunk) => ({
+        chunk,
+        metadata: {
+          pageUrl: url,
+          linksFound,
+        },
+      }));
+
+      // Write out JSON
+      // file name = slug of page url
+      const fileSlug = url
+        .replace(/https?:\/\//, "")
+        .replace(/[^\w\d]+/g, "_")
+        .toLowerCase();
+
+      // Write to data folder
+      const filePath = path.join(dataFolder, fileSlug + ".json");
+      fs.writeFileSync(filePath, JSON.stringify(pageData, null, 2), "utf-8");
+
+      // Also write to home directory crawl folder
+      const homeFilePath = path.join(homeCrawlFolder, fileSlug + ".json");
+      fs.writeFileSync(
+        homeFilePath,
+        JSON.stringify(pageData, null, 2),
+        "utf-8"
+      );
+
+      // Create an array of points with properly awaited embeddings
+      console.error(`Creating embeddings for ${chunks.length} chunks...`);
+
+      // Process in smaller batches to avoid memory issues
+      const BATCH_SIZE = 5;
+      let batchCounter = 0;
+
+      for (
+        let batchStart = 0;
+        batchStart < pageData.length;
+        batchStart += BATCH_SIZE
+      ) {
+        batchCounter++;
+        console.error(`Processing batch ${batchCounter}...`);
+
+        const batchItems = pageData.slice(batchStart, batchStart + BATCH_SIZE);
+        const points: PointStruct[] = [];
+
+        // Generate embeddings for this batch
+        for (const item of batchItems) {
+          try {
+            // Generate embedding directly from the chunk
+            const vector = embedText(item.chunk);
+            console.error(
+              `Generated vector with ${vector.length} dimensions for chunk of ${item.chunk.length} chars`
+            );
+
+            points.push({
+              vector,
+              payload: {
+                pageUrl: item.metadata.pageUrl,
+                chunk: item.chunk,
+              },
+            });
+          } catch (error) {
+            console.error(`Error embedding chunk: ${error}`);
+          }
+        }
+
+        if (points.length === 0) {
+          console.error(
+            `No valid points in batch ${batchCounter}, skipping...`
+          );
+          continue;
+        }
+
+        console.error(`Upserting ${points.length} points to Qdrant...`);
+
+        try {
+          // Prepare array of IDs - make sure they're globally unique across all batches
+          const ids = points.map((_, idx) => `${fileSlug}-${batchStart + idx}`);
+          const vectors = points.map((p) => p.vector);
+          const payloads = points.map((p) => p.payload);
+
+          // Batch upsert to Qdrant
+          const result = await qdrantClient.upsert(baseUrlSlug, {
+            wait: true,
+            batch: {
+              ids,
+              vectors,
+              payloads,
+            },
+          });
+
+          console.error(`Batch ${batchCounter} upsert result:`, result);
+        } catch (err) {
+          console.error(
+            `Error upserting batch ${batchCounter} to Qdrant:`,
+            err
+          );
+          if (err instanceof Error) {
+            console.error(`Error name: ${err.name}`);
+            console.error(`Error message: ${err.message}`);
+            console.error(`Error stack: ${err.stack}`);
+          }
         }
       }
-    }
 
-    console.error(`Stored ${chunks.length} chunks from ${url}`);
+      console.error(`Stored ${chunks.length} chunks from ${url}`);
+    }
+  } finally {
+    // Close browser when done or on error
+    await browser.close();
+    console.error(`Browser closed.`);
   }
 
   console.error(`Crawling complete for ${baseUrl}. Data folders: 
@@ -519,9 +576,6 @@ async function searchInQdrant(
   }
 }
 
-// ---------- MCP SERVER SETUP ----------
-import { z } from "zod";
-
 // Create MCP server
 const server = new McpServer({
   name: "docs-crawler",
@@ -543,7 +597,10 @@ server.tool(
       .default(false)
       .describe("If true, remove old data first and re-crawl"),
   },
-  async ({ baseUrl, forceRecrawl }) => {
+  async (params) => {
+    const baseUrl = params.baseUrl as string;
+    const forceRecrawl = params.forceRecrawl as boolean;
+
     try {
       console.error(`Starting crawl for ${baseUrl}...`);
       await bfsCrawl(baseUrl, forceRecrawl);
@@ -574,7 +631,7 @@ server.tool(
 // ---------- TOOL #2: search docs ----------
 server.tool(
   "search-docs",
-  "Search the previously crawled docs for relevant chunks. Please use different queries relateded to the current conversation to find what you are looking for. Do at least 3 queries",
+  "Search the previously crawled docs for relevant chunks",
   {
     baseUrl: z
       .string()
@@ -583,9 +640,12 @@ server.tool(
       .array(z.string())
       .describe("Array of query strings to search for"),
   },
-  async ({ baseUrl, queries }) => {
-    // We fetch top 3 results per query
-    const topK = 3;
+  async (params) => {
+    const baseUrl = params.baseUrl as string;
+    const queries = params.queries as string[];
+
+    // We fetch top results per query
+    const topK = 10;
 
     // Check if we have a data folder for that baseUrl
     const baseUrlSlug = baseUrl
