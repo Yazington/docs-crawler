@@ -2,11 +2,9 @@
 
 This project implements a Model Context Protocol (MCP) server that allows you to crawl documentation websites, store the content locally, and search through it using vector embeddings.
 
---------
-![image](https://github.com/user-attachments/assets/fc3ff083-f786-4a80-a726-9e0d376a5b58)
---------
+---
 
-
+## ![image](https://github.com/user-attachments/assets/fc3ff083-f786-4a80-a726-9e0d376a5b58)
 
 ## Features
 
@@ -33,7 +31,18 @@ This server provides two main tools accessible via MCP:
 
 - **Node.js:** Version 18 or later recommended.
 - **npm:** Node Package Manager (usually comes with Node.js).
+- **Python & pip:** Required for the `unstructured` library. Ensure Python and pip are installed and accessible in your system's PATH.
+- **Unstructured:** A Python library used for document parsing. Install it via pip: `pip install unstructured`.
 - **Qdrant:** A running instance of the Qdrant vector database. The server defaults to connecting to `http://localhost:6333`.
+
+**Note on PATH:** The MCP server process needs to be able to find the `unstructured` command. If you encounter "'unstructured' is not recognized" errors, you may need to manually add the Python `Scripts` directory (where pip installs executables) to the `PATH` environment variable within the server's configuration in your `cline_mcp_settings.json` or `claude_desktop_config.json` file, similar to this:
+
+```json
+"env": {
+  "PATH": "C:/path/to/your/Python/Scripts;${env:PATH}"
+  // ... other env vars
+}
+```
 
 ## Setup
 
