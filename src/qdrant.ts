@@ -3,7 +3,7 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
 import * as fs from "fs";
 import * as path from "path";
-import { embedText, VECTOR_SIZE } from "./embeddings.js"; // Import VECTOR_SIZE as well
+import { embedText, embedTextSync, VECTOR_SIZE } from "./embeddings.js"; // Added embedTextSync
 
 // Define our own type for vector points since the library doesn't export it
 export interface PointStruct {
@@ -101,7 +101,8 @@ export async function upsertChunksToQdrant(
     for (let i = 0; i < batchItems.length; i++) {
       const item = batchItems[i];
       try {
-        const vector = embedText(item.chunk);
+        // Use the synchronous wrapper for now to maintain compatibility
+        const vector = embedTextSync(item.chunk);
         console.error(
           `Generated vector with ${vector.length} dimensions for chunk ${
             batchStart + i
@@ -190,7 +191,8 @@ export async function searchInQdrant(
 
   // --- Vector Search Attempt ---
   try {
-    const queryVector = embedText(query);
+    // Use the synchronous version for now to maintain compatibility
+    const queryVector = embedTextSync(query);
     console.error(
       `Generated query vector with ${queryVector.length} dimensions`
     );

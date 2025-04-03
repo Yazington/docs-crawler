@@ -13,7 +13,11 @@ import {
   upsertChunksToQdrant,
 } from "./qdrant.js";
 import { VECTOR_SIZE } from "./embeddings.js";
-import { extractLinksFromPage, extractMarkdownFromPage } from "./textUtils.js"; // Import the new function
+import {
+  extractLinksFromPage,
+  extractMarkdownFromPage,
+  semanticChunking,
+} from "./textUtils.js"; // Added semanticChunking
 
 // Define the structure for page data items used locally before upserting
 interface PageDataItem {
@@ -21,6 +25,7 @@ interface PageDataItem {
   metadata: {
     pageUrl: string;
     linksFound: string[];
+    [key: string]: any; // Add support for additional metadata properties
   };
 }
 
@@ -245,16 +250,37 @@ export async function bfsCrawl(
         continue;
       }
 
-      // Build a single chunk object using the extracted Markdown
-      pageData = [
-        {
-          chunk: markdownContent, // Use the extracted markdown
-          metadata: {
-            pageUrl: normalizedUrl,
-            linksFound,
-          },
+      // Process the extracted markdown into semantic chunks
+      console.log(
+        `Processing markdown into semantic chunks for ${normalizedUrl}...`
+      );
+
+      // Base metadata for all chunks from this page
+      const baseMetadata = {
+        pageUrl: normalizedUrl,
+        linksFound,
+        crawledAt: new Date().toISOString(),
+      };
+
+      // Use semantic chunking to break down the content
+      const semanticChunks = semanticChunking(markdownContent, baseMetadata);
+      console.log(
+        `Created ${semanticChunks.length} semantic chunks for ${normalizedUrl}`
+      );
+
+      // Convert semantic chunks to page data format - explicitly include required properties
+      pageData = semanticChunks.map((chunk, index) => ({
+        chunk: chunk.text,
+        metadata: {
+          ...chunk.metadata,
+          // Ensure these required properties are always present
+          pageUrl: normalizedUrl,
+          linksFound: linksFound,
+          // Additional metadata
+          chunkIndex: index,
+          totalChunks: semanticChunks.length,
         },
-      ];
+      }));
 
       // Save locally
       const fileSlug = normalizedUrl
@@ -277,7 +303,9 @@ export async function bfsCrawl(
           JSON.stringify(pageData, null, 2),
           "utf-8"
         );
-        console.log(`Saved 1 chunk from ${normalizedUrl} to local files.`);
+        console.log(
+          `Saved ${pageData.length} chunks from ${normalizedUrl} to local files.`
+        );
       } catch (writeErr) {
         console.error(
           `Error writing local files for ${normalizedUrl}:`,

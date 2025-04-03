@@ -4,50 +4,289 @@ import type { Page } from "puppeteer"; // Import Page type for type safety
 import { convertHtmlToMarkdown } from "dom-to-semantic-markdown";
 import { JSDOM } from "jsdom"; // Import JSDOM
 
+// Maximum size for each chunk in characters
+export const MAX_CHUNK_SIZE = 4000; // Reduced from 6000 to create more focused chunks
+// Minimum size for a chunk that could stand on its own
+export const MIN_CHUNK_SIZE = 250;
+// Size of overlap between chunks to maintain context
+export const CHUNK_OVERLAP = 500;
+
+interface SectionNode {
+  title: string;
+  level: number;
+  content: string;
+  children: SectionNode[];
+  startPosition: number;
+}
+
 /**
- * Splits text into paragraphs first, then ensures each chunk is ~<= 6000 chars.
- * If a paragraph is over 6000 chars, further split by sentences or smaller fragments.
+ * Splits text into semantic chunks based on headers, paragraphs, and content structure.
+ * Uses sliding window approach with overlap for large sections.
+ *
+ * @param markdown The markdown text to chunk
+ * @param metadata Optional metadata to include in the result
+ * @returns Array of chunks, each with text and metadata
  */
-export function chunkTextTo6000Chars(rawText: string): string[] {
-  // Split by double newlines / paragraph
-  const paragraphs = rawText
-    .split(/\n\s*\n/)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
+export function semanticChunking(
+  markdown: string,
+  metadata: Record<string, any> = {}
+): Array<{ text: string; metadata: Record<string, any> }> {
+  if (!markdown || markdown.trim().length === 0) {
+    return [];
+  }
 
-  const chunks: string[] = [];
+  // Step 1: Parse the document structure into a hierarchical tree based on headings
+  const docStructure = parseDocumentStructure(markdown);
 
-  for (const paragraph of paragraphs) {
-    if (paragraph.length <= 6000) {
-      chunks.push(paragraph);
-    } else {
-      // If the paragraph is bigger than 6000, try splitting by sentences
-      const sentences = paragraph.split(/[.!?](\s|$)/);
-      let currentChunk = "";
+  // Step 2: Process the structure into chunks
+  return processStructureIntoChunks(docStructure, metadata);
+}
 
-      for (const sentence of sentences) {
-        const trimmed = sentence.trim();
-        if (!trimmed) continue;
+/**
+ * Parse markdown into a hierarchical document structure based on headers
+ */
+function parseDocumentStructure(markdown: string): SectionNode {
+  // Root node of the document
+  const root: SectionNode = {
+    title: "Document Root",
+    level: 0,
+    content: "",
+    children: [],
+    startPosition: 0,
+  };
 
-        // If adding this sentence exceeds limit, push current chunk and start a new one
-        if ((currentChunk + trimmed).length > 6000) {
-          if (currentChunk.length > 0) {
-            chunks.push(currentChunk);
-          }
-          currentChunk = trimmed;
-        } else {
-          currentChunk = currentChunk ? currentChunk + ". " + trimmed : trimmed;
+  // Current position in the parse process
+  let currentSection: SectionNode = root;
+  let currentContent = "";
+  const lines = markdown.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Check if this line is a header (markdown headers start with # to ######)
+    const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
+
+    if (headerMatch) {
+      // We found a header, so commit any accumulated content to the current section
+      if (currentContent.trim()) {
+        currentSection.content += currentContent.trim();
+        currentContent = "";
+      }
+
+      // Determine header level and title
+      const level = headerMatch[1].length;
+      const title = headerMatch[2].trim();
+
+      // Create a new section node
+      const newSection: SectionNode = {
+        title,
+        level,
+        content: "",
+        children: [],
+        startPosition: i,
+      };
+
+      // Find the appropriate parent for this section based on header level
+      let parent = root;
+      for (let j = root.children.length - 1; j >= 0; j--) {
+        const potentialParent = findDeepestSectionWithLevelLessThan(
+          root.children[j],
+          level
+        );
+        if (potentialParent && potentialParent.level < level) {
+          parent = potentialParent;
+          break;
         }
       }
 
-      // Push any remainder
-      if (currentChunk.length > 0) {
-        chunks.push(currentChunk);
-      }
+      // Add the new section to its parent
+      parent.children.push(newSection);
+      currentSection = newSection;
+    } else {
+      // Not a header, accumulate content
+      currentContent += line + "\n";
     }
   }
 
+  // Add any remaining content to the current section
+  if (currentContent.trim()) {
+    currentSection.content += currentContent.trim();
+  }
+
+  return root;
+}
+
+/**
+ * Find the deepest section with a level less than the given level
+ */
+function findDeepestSectionWithLevelLessThan(
+  section: SectionNode,
+  level: number
+): SectionNode | null {
+  if (section.level < level) {
+    // If this section has no children, or none have a level less than the target
+    if (section.children.length === 0) {
+      return section;
+    }
+
+    // Try to find a deeper section among the children
+    for (let i = section.children.length - 1; i >= 0; i--) {
+      const deeperSection = findDeepestSectionWithLevelLessThan(
+        section.children[i],
+        level
+      );
+      if (deeperSection) {
+        return deeperSection;
+      }
+    }
+
+    // If no deeper section was found among children, return this one
+    return section;
+  }
+
+  return null;
+}
+
+/**
+ * Process the document structure into content chunks
+ */
+function processStructureIntoChunks(
+  rootNode: SectionNode,
+  baseMetadata: Record<string, any>
+): Array<{ text: string; metadata: Record<string, any> }> {
+  const chunks: Array<{ text: string; metadata: Record<string, any> }> = [];
+
+  // Process each top-level section
+  for (const section of rootNode.children) {
+    processSection(section, "", chunks, baseMetadata);
+  }
+
+  // Handle any content in the root node itself
+  if (rootNode.content.trim()) {
+    addContentToChunks(rootNode.content, "Introduction", chunks, baseMetadata);
+  }
+
   return chunks;
+}
+
+/**
+ * Process a section and its children into chunks
+ */
+function processSection(
+  section: SectionNode,
+  parentPath: string,
+  chunks: Array<{ text: string; metadata: Record<string, any> }>,
+  baseMetadata: Record<string, any>
+): void {
+  // Create the section path (breadcrumb) for context
+  const sectionPath = parentPath
+    ? `${parentPath} > ${section.title}`
+    : section.title;
+
+  // Add the section's own content
+  if (section.content.trim()) {
+    // Create a markdown representation with the heading
+    const headingMarks = "#".repeat(section.level);
+    const contentWithHeading = `${headingMarks} ${section.title}\n\n${section.content}`;
+
+    addContentToChunks(contentWithHeading, sectionPath, chunks, baseMetadata);
+  }
+
+  // Process all children recursively
+  for (const child of section.children) {
+    processSection(child, sectionPath, chunks, baseMetadata);
+  }
+}
+
+/**
+ * Add content to chunks, splitting if necessary based on size
+ */
+function addContentToChunks(
+  content: string,
+  sectionPath: string,
+  chunks: Array<{ text: string; metadata: Record<string, any> }>,
+  baseMetadata: Record<string, any>
+): void {
+  // If content is small enough, add it directly
+  if (content.length <= MAX_CHUNK_SIZE) {
+    chunks.push({
+      text: content,
+      metadata: {
+        ...baseMetadata,
+        section: sectionPath,
+      },
+    });
+    return;
+  }
+
+  // For larger content, we need to split it into overlapping chunks
+  const paragraphs = splitIntoParagraphs(content);
+
+  let currentChunk = "";
+  let currentParagraphIndex = 0;
+
+  while (currentParagraphIndex < paragraphs.length) {
+    // Add paragraphs until we reach or exceed the chunk size
+    while (
+      currentParagraphIndex < paragraphs.length &&
+      currentChunk.length + paragraphs[currentParagraphIndex].length + 1 <=
+        MAX_CHUNK_SIZE
+    ) {
+      if (currentChunk) currentChunk += "\n\n";
+      currentChunk += paragraphs[currentParagraphIndex];
+      currentParagraphIndex++;
+    }
+
+    // If we've built up a substantial chunk, add it
+    if (currentChunk.length >= MIN_CHUNK_SIZE) {
+      chunks.push({
+        text: currentChunk,
+        metadata: {
+          ...baseMetadata,
+          section: sectionPath,
+        },
+      });
+    }
+
+    // If we've processed all paragraphs, we're done
+    if (currentParagraphIndex >= paragraphs.length) {
+      break;
+    }
+
+    // For overlap, go back a few paragraphs, but ensure we make forward progress
+    const backtrackCount = Math.min(
+      // Don't go back further than half the paragraphs we've processed
+      Math.floor(currentParagraphIndex / 2),
+      // And ensure we have some minimum overlap
+      Math.max(1, Math.ceil(CHUNK_OVERLAP / 100))
+    );
+
+    // Reset to create next chunk with overlap
+    currentParagraphIndex = Math.max(0, currentParagraphIndex - backtrackCount);
+    currentChunk = "";
+  }
+}
+
+/**
+ * Split text into paragraphs
+ */
+function splitIntoParagraphs(text: string): string[] {
+  return text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+}
+
+/**
+ * Legacy function maintained for backward compatibility.
+ * Splits text into paragraphs first, then ensures each chunk is ~<= 6000 chars.
+ */
+export function chunkTextTo6000Chars(rawText: string): string[] {
+  // Simply delegate to semantic chunking, but discard the metadata and keep just the text
+  console.error(
+    "Legacy chunkTextTo6000Chars function called, using semantic chunking instead"
+  );
+  return semanticChunking(rawText).map((chunk) => chunk.text);
 }
 
 /**
