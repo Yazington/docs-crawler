@@ -7,6 +7,7 @@ import * as fs from "fs";
 import * as path from "path";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
+import * as os from "os";
 
 // For local vector DB (Qdrant):
 import { QdrantClient } from "@qdrant/js-client-rest";
@@ -179,13 +180,30 @@ async function bfsCrawl(baseUrl: string, forceRecrawl: boolean): Promise<void> {
   // Data folder: e.g. ./data/example_com_docs
   const dataFolder = path.join("./data", baseUrlSlug);
 
+  // Additional folder in user's home directory
+  const homeDir = os.homedir();
+  const homeCrawlFolder = path.join(homeDir, "crawled-docs", baseUrlSlug);
+
   // If forceRecrawl => remove existing data & re-crawl
-  if (forceRecrawl && fs.existsSync(dataFolder)) {
-    fs.rmSync(dataFolder, { recursive: true, force: true });
+  if (forceRecrawl) {
+    if (fs.existsSync(dataFolder)) {
+      fs.rmSync(dataFolder, { recursive: true, force: true });
+    }
+    if (fs.existsSync(homeCrawlFolder)) {
+      fs.rmSync(homeCrawlFolder, { recursive: true, force: true });
+    }
   }
 
   if (!fs.existsSync(dataFolder)) {
     fs.mkdirSync(dataFolder, { recursive: true });
+  }
+
+  // Ensure the home directory crawl folder exists
+  if (!fs.existsSync(path.join(homeDir, "crawled-docs"))) {
+    fs.mkdirSync(path.join(homeDir, "crawled-docs"), { recursive: true });
+  }
+  if (!fs.existsSync(homeCrawlFolder)) {
+    fs.mkdirSync(homeCrawlFolder, { recursive: true });
   }
 
   // Prepare a Qdrant collection for this baseUrl
@@ -285,8 +303,14 @@ async function bfsCrawl(baseUrl: string, forceRecrawl: boolean): Promise<void> {
       .replace(/https?:\/\//, "")
       .replace(/[^\w\d]+/g, "_")
       .toLowerCase();
+
+    // Write to data folder
     const filePath = path.join(dataFolder, fileSlug + ".json");
     fs.writeFileSync(filePath, JSON.stringify(pageData, null, 2), "utf-8");
+
+    // Also write to home directory crawl folder
+    const homeFilePath = path.join(homeCrawlFolder, fileSlug + ".json");
+    fs.writeFileSync(homeFilePath, JSON.stringify(pageData, null, 2), "utf-8");
 
     // Create an array of points with properly awaited embeddings
     console.error(`Creating embeddings for ${chunks.length} chunks...`);
@@ -364,7 +388,9 @@ async function bfsCrawl(baseUrl: string, forceRecrawl: boolean): Promise<void> {
     console.error(`Stored ${chunks.length} chunks from ${url}`);
   }
 
-  console.error(`Crawling complete for ${baseUrl}. Data folder: ${dataFolder}`);
+  console.error(`Crawling complete for ${baseUrl}. Data folders: 
+  - ${dataFolder}
+  - ${homeCrawlFolder}`);
 }
 
 // ---------- HELPER: SEARCH ----------
